@@ -2,6 +2,7 @@ import warnings
 from typing import Optional, List, Dict, Union
 
 import numpy as np
+import pandas as pd
 from numpy.linalg import norm
 import torch
 import torch.nn.functional as F
@@ -12,6 +13,9 @@ from sklearn.preprocessing import MaxAbsScaler, StandardScaler
 import anndata
 import sklearn
 import scanpy as sc
+
+from collections import Counter
+from typing import Optional, Callable, Union, Iterable
 
 def lsi(adata: anndata.AnnData, n_components: int = 20,
         use_highly_variable: Optional[bool] = None, **kwargs) -> None:
@@ -373,10 +377,151 @@ def leiden_shared_mask(
     return mask_A, mask_B
 
 
-def get_unique_celltypes(adata, key):
-    if key in adata.obs and adata.obs[key].dtype.name == 'category':
-        if 'unknown' not in adata.obs[key].cat.categories:
-            adata.obs[key].cat.add_categories('unknown', inplace=True)
-        adata.obs[key] = adata.obs[key].fillna('unknown')
+def compute_celltype_weights(
+    celltype_series_A: Union[pd.Series, Iterable],  
+    celltype_series_B: Union[pd.Series, Iterable],  
+    unique_labels: Union[np.ndarray, list],         
+    weight_foo: Callable = np.sqrt,
+    n_add: int = 0,
+    device: Optional[torch.device] = None
+) -> torch.Tensor:
+
+    def make_class_weights(
+        celltype_combined: Iterable,
+        unique_labels: list,
+        foo: Callable = np.sqrt,
+        n_add: int = 0,
+        astensor: bool = True
+    ) -> Union[np.ndarray, torch.Tensor]:
+
+        counter = Counter(celltype_combined)
+        counts = []
+        for label in unique_labels:
+            counts.append(counter.get(label, 0)) 
+        counts = np.array(counts, dtype=np.int64)
+        
+        n_cls = len(unique_labels) + n_add
+        weights = np.array([1 / foo(c + 1) if c > 0 else 0 for c in counts])
+        
+        if weights.sum() > 0:
+            weights = weights / weights.sum() * (1 - n_add / n_cls)
+        else:
+            weights = np.zeros_like(weights)
+
+        weights = np.concatenate([weights, np.array([1 / n_cls] * n_add)])
     
-    return np.unique(adata.obs[key])
+        if astensor:
+            return torch.Tensor(weights.astype(np.float32))
+        return weights
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    if len(unique_labels) == 0:
+        return torch.tensor([], device=device, dtype=torch.float32)
+    
+    celltype_list_A = celltype_series_A.tolist() if isinstance(celltype_series_A, pd.Series) else list(celltype_series_A)
+    celltype_list_B = celltype_series_B.tolist() if isinstance(celltype_series_B, pd.Series) else list(celltype_series_B)
+    celltype_combined = celltype_list_A + celltype_list_B
+    
+    weight = make_class_weights(
+        celltype_combined=celltype_combined,
+        unique_labels=unique_labels,
+        foo=weight_foo,
+        n_add=n_add,
+        astensor=True
+    )
+    
+    return weight.to(device, non_blocking=True)
+
+
+def build_proto_and_update_dataset(
+    z_A,
+    z_B,
+    dataset_A,
+    dataset_B,
+    num_classes: int,
+    threshold: float = 0.7,
+    normalize: bool = True,
+    device: torch.device | None = None,
+):
+
+    if not torch.is_tensor(z_A):
+        z_A = torch.tensor(z_A, dtype=torch.float32)
+    if not torch.is_tensor(z_B):
+        z_B = torch.tensor(z_B, dtype=torch.float32)
+
+    if device is not None:
+        z_A = z_A.to(device)
+        z_B = z_B.to(device)
+
+    y_A = torch.tensor(dataset_A.celltypes, dtype=torch.long, device=z_A.device)
+    y_B = torch.tensor(dataset_B.celltypes, dtype=torch.long, device=z_A.device)
+
+    n_A = z_A.shape[0]
+
+    Z = torch.cat([z_A, z_B], dim=0)
+    Y = torch.cat([y_A, y_B], dim=0)
+
+    if normalize:
+        Z = F.normalize(Z, dim=1)
+
+    prototypes = []
+    for c in range(num_classes):
+        mask_c = Y == c
+        if mask_c.sum() == 0:
+            proto = torch.zeros(Z.size(1), device=Z.device)
+        else:
+            proto = Z[mask_c].mean(dim=0)
+            if normalize:
+                proto = F.normalize(proto, dim=0)
+        prototypes.append(proto)
+
+    prototypes = torch.stack(prototypes) 
+
+    unlabeled_mask = Y < 0
+
+    if unlabeled_mask.sum() == 0:
+        print("No unlabeled cells found. Nothing updated.")
+
+    Z_unlabeled = Z[unlabeled_mask]
+
+    sim = torch.matmul(Z_unlabeled, prototypes.T)
+
+    conf, pred = sim.max(dim=1)
+
+    confident = conf > threshold
+
+    idx_unlabeled = torch.where(unlabeled_mask)[0]
+    idx_update = idx_unlabeled[confident]
+
+    if len(idx_update) == 0:
+        print("No confident pseudo labels assigned.")
+
+    pseudo_labels = Y.clone()
+    pseudo_labels[idx_update] = pred[confident]
+
+    pseudo_A = pseudo_labels[:n_A].cpu().numpy()
+    pseudo_B = pseudo_labels[n_A:].cpu().numpy()
+
+    mask_A = (dataset_A.celltypes == -1) & (pseudo_A != -1)
+    mask_B = (dataset_B.celltypes == -1) & (pseudo_B != -1)
+
+    dataset_A.update_pseudo_labels(pseudo_A, mask_A)
+    dataset_B.update_pseudo_labels(pseudo_B, mask_B)
+
+    unknown_A = (y_A == -1)
+    unknown_B = (y_B == -1)
+
+    num_unknown_A = unknown_A.sum().item()
+    num_unknown_B = unknown_B.sum().item()
+
+    num_update_A = mask_A.sum().item()
+    num_update_B = mask_B.sum().item()
+
+    print(f"Updated A: {num_update_A}/{num_unknown_A} "
+        f"({num_update_A / (num_unknown_A + 1e-8) * 100:.2f}%)")
+
+    print(f"Updated B: {num_update_B}/{num_unknown_B} "
+        f"({num_update_B / (num_unknown_B + 1e-8) * 100:.2f}%)")
+
