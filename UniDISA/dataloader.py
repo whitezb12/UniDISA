@@ -34,6 +34,7 @@ class AnnDataDataset(Dataset):
         self.link_feat = self._convert_to_tensor(adata.obsm["link_feat"]) if "link_feat" in adata.obsm else None
         self.sources = self._encode_obs_column(adata, source_key) if source_key is not None else None
         self.celltypes = self._encode_obs_column(adata, celltype_key, unique_labels) if celltype_key is not None else None
+        self.pseudo_labels = np.full_like(self.celltypes, fill_value=-1)
 
     def _get_input_tensor(self, adata: AnnData, input_key: Optional[str]) -> torch.Tensor:
         if input_key is None:
@@ -91,6 +92,8 @@ class AnnDataDataset(Dataset):
         if self.mode == "integration":
             if self.celltypes is not None:
                 sample["celltype"] = torch.tensor(self.celltypes[idx], dtype=torch.long)
+            if self.pseudo_labels is not None:
+                sample["pseudo_label"] = torch.tensor(self.pseudo_labels[idx], dtype=torch.long)
             if self.sources is not None:
                 sample["source"] = torch.tensor(self.sources[idx], dtype=torch.long)
             if self.link_feat is not None:
@@ -101,6 +104,11 @@ class AnnDataDataset(Dataset):
             sample["output"] = self.output[idx]
 
         return sample
+    
+    def update_pseudo_labels(self, new_labels: np.ndarray, mask: np.ndarray):
+        if len(new_labels) != len(self.pseudo_labels):
+            raise ValueError("Length mismatch when updating pseudo labels.")
+        self.pseudo_labels[mask] = new_labels[mask]
 
     @property
     def feature_shapes(self) -> Dict[str, int]:
@@ -209,4 +217,3 @@ def load_data(
         dataloader = DataLoader(dataset, batch_sampler=batch_sampler, num_workers=0)
 
     return dataloader
-
