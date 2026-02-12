@@ -100,15 +100,11 @@ class MultiClassDiscriminator(nn.Module):
         return torch.clamp(score, min=-50.0, max=50.0)
 
 
-class Classfier(nn.Module):
+class LinearClassifier(nn.Module):
     def __init__(self, n_input: int, num_classes: int) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_input, 512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, num_classes),
+            nn.Linear(n_input, num_classes)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -128,4 +124,3 @@ class Decoder(nn.Module):
     def forward(self, x: torch.Tensor):
         h = F.relu(self.fc1(x))
         return h
-
