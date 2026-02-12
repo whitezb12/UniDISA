@@ -456,7 +456,7 @@ class IntegrationModel:
                          )
         
         if self.celltype_col is not None:
-            self.CLS = Classifier(self.n_latent, self.unique_celltypes.shape[0])
+            self.CLS = LinearClassifier(self.n_latent, self.unique_celltypes.shape[0])
             self.CLS = self.CLS.to(self.device)
             self.params_G += list(self.CLS.parameters()) 
         
@@ -690,3 +690,4 @@ class IntegrationModel:
                 n_add=0,
                 device=self.device
             )
+
