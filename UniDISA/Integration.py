@@ -3,9 +3,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-from mycode.dataloader import *
-from mycode.utils import *
-from mycode.network import *
+from UniDISA.dataloader import *
+from UniDISA.utils import *
+from UniDISA.network import *
 from itertools import chain
 import os
 
@@ -20,11 +20,11 @@ class IntegrationModel:
         n_latent: int = 10,
         celltype_col: Optional[str] = None,
         source_col: Optional[str] = None,
-        device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        device: Optional[torch.device] = None,
         seed: int = 1234,
     ):
-
-        self.device = device
+        
+        self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         torch.manual_seed(seed)
         np.random.seed(seed)
@@ -37,9 +37,22 @@ class IntegrationModel:
         self.celltype_col = celltype_col
         self.source_col = source_col
         
-        celltypes_A = np.unique(adata_A.obs[self.celltype_col].dropna()) if self.celltype_col in adata_A.obs else np.array([])
-        celltypes_B = np.unique(adata_B.obs[self.celltype_col].dropna()) if self.celltype_col in adata_B.obs else np.array([])
-        self.unique_celltypes = np.union1d(celltypes_A, celltypes_B)
+        if self.celltype_col is not None:
+            celltypes_A = np.unique(adata_A.obs[self.celltype_col].dropna()) if self.celltype_col in adata_A.obs else np.array([])
+            celltypes_B = np.unique(adata_B.obs[self.celltype_col].dropna()) if self.celltype_col in adata_B.obs else np.array([])
+            self.unique_celltypes = np.union1d(celltypes_A, celltypes_B)
+            self.weight1 = compute_celltype_weights(
+                celltype_series_A=adata_A.obs[self.celltype_col].dropna(),  
+                celltype_series_B=adata_B.obs[self.celltype_col].dropna(),  
+                unique_labels=self.unique_celltypes,         
+                weight_foo=np.sqrt,
+                n_add=0,
+                device=self.device
+            )  #True label weight
+            self.weight2 = self.weight1 #Pseudo label weight
+        else:
+            self.unique_celltypes = None
+            self.weight = None
 
         self.dataset_A = AnnDataDataset(
             adata_A,
@@ -71,15 +84,16 @@ class IntegrationModel:
         self,
         training_steps: int = 2000,
         lambdaRecon: float = 10.0,
-        lambdaLA: float = 1.0,
+        lambdaLA: float = 10.0,
         lambdaDA: float = 1.0,
+        lambdasemi: float = 1.0
     ):
 
         self._init_models_and_optimizers()
         self._init_low_encoders()
         self._set_train_mode()
 
-        print("===== Stage 1: Initialize Matching =====")
+        print("===== Stage 1: Initial Alignment =====")
 
         iterator_A = iter(self.dataloader_A)
         iterator_B = iter(self.dataloader_B)
@@ -122,10 +136,18 @@ class IntegrationModel:
             z_dist = pairwise_euclidean_distance(mu_A, mu_B) + pairwise_euclidean_distance(sigma_A, sigma_B)
             loss_DA = torch.sum(P * z_dist) / torch.sum(P)
 
+            # semi loss
+            if self.celltype_col is not None:
+                loss_semi = self._compute_semi_loss(z_A, z_B, batch_A['celltype'], batch_B['celltype'], weight=self.weight1) 
+                loss_semi += self._compute_semi_loss(z_A, z_B, batch_A['pseudo_label'], batch_B['pseudo_label'], weight=self.weight2) 
+            else:
+                loss_semi = torch.tensor(0.0, device=self.device)
+
             total_loss = (
                 lambdaRecon * loss_AE
                 + lambdaLA * loss_LA
                 + lambdaDA * loss_DA
+                + lambdasemi * loss_semi
             )
 
             self.optimizer_G.zero_grad()
@@ -138,7 +160,8 @@ class IntegrationModel:
                     f"[Stage1 {step}] "
                     f"AE: {loss_AE.item():.4f} | "
                     f"LA: {loss_LA.item():.4f} | "
-                    f"DA: {loss_DA.item():.4f}"
+                    f"DA: {loss_DA.item():.4f} | "
+                    f"Semi: {loss_semi.item():.4f}"
                 )
 
         self.update_slow_encoder()
@@ -148,16 +171,18 @@ class IntegrationModel:
         self,
         training_steps: int = 3000,
         lambdaRecon: float = 10.0,
-        lambdaLA: float = 1.0,
+        lambdaLA: float = 10.0,
         lambdaDA: float = 1.0,
-        iters: int = 1,
+        lambdasemi: float = 1.0,
+        n_iters: int = 1,
+        use_shared_mask: bool = True,
     ):
 
         self._init_models_and_optimizers()
         self._set_train_mode()
 
-        for it in range(1, iters+1):
-            print(f"===== Stage 2: Iterative Alignment {it}/{iters} =====")
+        for it in range(1, n_iters+1):
+            print(f"===== Stage 2: Iterative Alignment {it}/{n_iters} =====")
 
             iterator_A = iter(self.dataloader_A)
             iterator_B = iter(self.dataloader_B)
@@ -166,6 +191,11 @@ class IntegrationModel:
 
                 batch_A = next(iterator_A)
                 batch_B = next(iterator_B)
+
+                mask_A = self.is_shared_A[batch_A["index"]]
+                mask_B = self.is_shared_B[batch_B["index"]]
+                if mask_A.sum() < 100 or mask_B.sum() < 100:
+                    continue
 
                 x_A = batch_A["input"].float().to(self.device)
                 x_B = batch_B["input"].float().to(self.device)
@@ -194,19 +224,27 @@ class IntegrationModel:
                 loss_LA = loss_LA_AtoB + loss_LA_BtoA 
 
                 # optimal transport process
-                C = pairwise_correlation_distance(link_A, link_B).to(self.device)
+                C = pairwise_correlation_distance(link_A[mask_A], link_B[mask_B]).to(self.device)
                 P = unbalanced_ot(C, reg=0.05, reg_m=0.1, device=self.device)
 
                 # distribution alignment 
                 sigma_A = torch.exp(0.5 * logvar_A)
                 sigma_B = torch.exp(0.5 * logvar_B)
-                z_dist = pairwise_euclidean_distance(mu_A, mu_B) + pairwise_euclidean_distance(sigma_A, sigma_B)
+                z_dist = pairwise_euclidean_distance(mu_A[mask_A], mu_B[mask_B]) + pairwise_euclidean_distance(sigma_A[mask_A], sigma_B[mask_B])
                 loss_DA = torch.sum(P * z_dist) / torch.sum(P)
+
+                # semi loss
+                if self.celltype_col is not None:
+                    loss_semi = self._compute_semi_loss(z_A, z_B, batch_A['celltype'], batch_B['celltype'], weight=self.weight1) 
+                    loss_semi += self._compute_semi_loss(z_A, z_B, batch_A['pseudo_label'], batch_B['pseudo_label'], weight=self.weight2) 
+                else:
+                    loss_semi = torch.tensor(0.0, device=self.device)
 
                 total_loss = (
                     lambdaRecon * loss_AE
                     + lambdaLA * loss_LA
                     + lambdaDA * loss_DA
+                    + lambdasemi * loss_semi
                 )
 
                 self.optimizer_G.zero_grad()
@@ -219,9 +257,12 @@ class IntegrationModel:
                         f"[Stage2 {step}] "
                         f"AE: {loss_AE.item():.4f} | "
                         f"LA: {loss_LA.item():.4f} | "
-                        f"DA: {loss_DA.item():.4f}"
+                        f"DA: {loss_DA.item():.4f} | "
+                        f"Semi: {loss_semi.item():.4f}"
                     )
-            if it < iters:
+            if use_shared_mask:
+                self.update_shared_mask()
+            if it < n_iters:
                 self.update_slow_encoder()
 
 
@@ -229,21 +270,18 @@ class IntegrationModel:
         self,
         training_steps: int = 10000,
         lambdaRecon: float = 10.0,
-        lambdaLA: float = 1.0,
+        lambdaLA: float = 10.0,
         lambdaDA: float = 1.0,
-        lambdamGAN: float = 0.5,
-        lambdabGAN: float = 1.0,
-        lambdaSemi: float=1.0
+        lambdamGAN: float = 1.0,
+        lambdabGAN: float = 0.5,
+        lambdasemi: float = 1.0,
+        use_mGAN: bool = True
     ):
 
         self._init_models_and_optimizers()
-        if self.celltype_col is not None:
-            self.CLS = Classfier(self.n_latent, self.unique_celltypes.shape[0])
-            self.CLS = self.CLS.to(self.device)
-            self.params_G += list(self.CLS.parameters()) 
         self._set_train_mode()
 
-        print("===== Stage 3: Shared Alignment =====")
+        print("===== Stage 3: Final Alignment =====")
 
         iterator_A = iter(self.dataloader_A)
         iterator_B = iter(self.dataloader_B)
@@ -260,9 +298,6 @@ class IntegrationModel:
 
             x_A = batch_A["input"].float().to(self.device)
             x_B = batch_B["input"].float().to(self.device)
-
-            _, link_A, _ = self.E_A_slow(x_A)
-            _, link_B, _ = self.E_B_slow(x_B)
 
             z_A, mu_A, logvar_A = self.E_A_fast(x_A)
             z_B, mu_B, logvar_B = self.E_B_fast(x_B)
@@ -285,43 +320,50 @@ class IntegrationModel:
             loss_LA = loss_LA_AtoB + loss_LA_BtoA 
 
             # optimal transport process
-            C = pairwise_correlation_distance(link_A, link_B).to(self.device)
+            if hasattr(self, "E_A_slow") and hasattr(self, "E_B_slow"):
+                _, link_A, _ = self.E_A_slow(x_A)
+                _, link_B, _ = self.E_B_slow(x_B)
+                C = pairwise_correlation_distance(link_A[mask_A], link_B[mask_B]).to(self.device)
+            else:
+                C = pairwise_correlation_distance(batch_A["link_feat"], batch_B["link_feat"]).to(self.device)
             P = unbalanced_ot(C, reg=0.05, reg_m=0.1, device=self.device)
 
             # distribution alignment 
             sigma_A = torch.exp(0.5 * logvar_A)
             sigma_B = torch.exp(0.5 * logvar_B)
-            z_dist = pairwise_euclidean_distance(mu_A, mu_B) + pairwise_euclidean_distance(sigma_A, sigma_B)
+            z_dist = pairwise_euclidean_distance(mu_A[mask_A], mu_B[mask_B]) + pairwise_euclidean_distance(sigma_A[mask_A], sigma_B[mask_B])
             loss_DA = torch.sum(P * z_dist) / torch.sum(P)
 
-            # discriminator loss
-            for _ in range(5):
-                self.optimizer_Dis_m.zero_grad() 
-                loss_mDis_A = (F.softplus(-self.Dis_Z(z_A[mask_A].detach()))).mean()
-                loss_mDis_B = (F.softplus(self.Dis_Z(z_B[mask_B].detach()))).mean()
-                loss_mDis = loss_mDis_A + loss_mDis_B
-                loss_mDis.backward()
-                self.optimizer_Dis_m.step()
+            # discriminator and generator loss
+            if use_mGAN:
+                for _ in range(5):
+                    self.optimizer_Dis_m.zero_grad() 
+                    loss_mDis_A = (F.softplus(-self.Dis_Z(z_A[mask_A].detach()))).mean()
+                    loss_mDis_B = (F.softplus(self.Dis_Z(z_B[mask_B].detach()))).mean()
+                    loss_mDis = loss_mDis_A + loss_mDis_B
+                    loss_mDis.backward()
+                    self.optimizer_Dis_m.step()            
+                loss_mGAN_A = -(F.softplus(-self.Dis_Z(z_A[mask_A]))).mean()
+                loss_mGAN_B = -(F.softplus(self.Dis_Z(z_B[mask_B]))).mean()
+                loss_mGAN = loss_mGAN_A + loss_mGAN_B
+            else:
+                loss_mGAN = torch.tensor(0.0, device=self.device)
 
-            if self.optimizer_Dis_b:
+            if self.optimizer_Dis_b and self.source_col is not None:
                 self.optimizer_Dis_b.zero_grad()
                 loss_bDis = self.compute_discriminator_loss_intra(z_A.detach(), z_B.detach(), batch_A['source'], batch_B['source'])
                 loss_bDis.backward()
                 self.optimizer_Dis_b.step()
+                loss_bGAN = -self.compute_discriminator_loss_intra(z_A, z_B, batch_A['source'], batch_B['source'])  
             else:
-                loss_bDis = torch.tensor(0.0, device=self.device)
-
-            # generator loss
-            loss_mGAN_A = -(F.softplus(-self.Dis_Z(z_A[mask_A]))).mean()
-            loss_mGAN_B = -(F.softplus(self.Dis_Z(z_B[mask_B]))).mean()
-            loss_mGAN = loss_mGAN_A + loss_mGAN_B
-            loss_bGAN = -self.compute_discriminator_loss_intra(z_A, z_B, batch_A['source'], batch_B['source'])   
+                loss_bGAN = torch.tensor(0.0, device=self.device)                
 
             # semi loss
             if self.celltype_col is not None:
-                loss_semi = self._compute_semi_loss(z_A, z_B, batch_A['celltype'], batch_B['celltype'])
+                loss_semi = self._compute_semi_loss(z_A, z_B, batch_A['celltype'], batch_B['celltype'], weight=self.weight1) 
+                loss_semi += self._compute_semi_loss(z_A, z_B, batch_A['pseudo_label'], batch_B['pseudo_label'], weight=self.weight2) 
             else:
-                loss_semi = torch.tensor(0.0, device=z_A.device)
+                loss_semi = torch.tensor(0.0, device=self.device)
             
             total_loss = (
                 lambdaRecon * loss_AE
@@ -329,7 +371,7 @@ class IntegrationModel:
                 + lambdaDA * loss_DA
                 + lambdamGAN * loss_mGAN
                 + lambdabGAN * loss_bGAN
-                + lambdaSemi * loss_semi
+                + lambdasemi * loss_semi
             )
 
             self.optimizer_G.zero_grad()
@@ -360,36 +402,43 @@ class IntegrationModel:
         return sum(losses)
     
 
-    def _compute_semi_loss(self, z_A: torch.Tensor, z_B: torch.Tensor, celltype_A: torch.Tensor, celltype_B: torch.Tensor, label_smoothing: float = 0.1) -> torch.Tensor:
-        loss_semi = torch.tensor(0.0, device=z_A.device)
-        
-        mask_cls_A = (celltype_A != -1)
-        mask_cls_B = (celltype_B != -1)
+    def _compute_semi_loss(
+        self, 
+        z_A: torch.Tensor, 
+        z_B: torch.Tensor, 
+        celltype_A: torch.Tensor, 
+        celltype_B: torch.Tensor, 
+        label_smoothing: float = 0.1,
+        reduction: str = 'mean',
+        weight: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
 
-        if mask_cls_A.sum() == 0 and mask_cls_B.sum() == 0:
-            return loss_semi
+        z_combined = torch.cat([z_A, z_B], dim=0)  
+        celltype_combined = torch.cat([celltype_A, celltype_B], dim=0)  
+        mask_cls_combined = (celltype_combined != -1) 
+        n_labeled = mask_cls_combined.sum().item()   
         
-        logits_A = self.CLS(z_A)
-        logits_B = self.CLS(z_B)
-
-        def label_smoothed_nll_loss(lprobs, target, eps):
-            nll_loss = -lprobs.gather(dim=-1, index=target.unsqueeze(-1))
-            nll_loss = nll_loss.squeeze(-1)
-            smooth_loss = -lprobs.mean(dim=-1)
-            loss = (1.0 - eps) * nll_loss + eps * smooth_loss
-            return loss.sum()
-
-        loss_semi_A = 0.0
-        if mask_cls_A.sum() > 0:
-            lprobs_A = F.log_softmax(logits_A[mask_cls_A], dim=-1)
-            loss_semi_A = label_smoothed_nll_loss(lprobs_A, celltype_A[mask_cls_A].to(self.device), label_smoothing)
+        if n_labeled == 0:
+            return torch.tensor(0.0, device=self.device, dtype=z_A.dtype)  
         
-        loss_semi_B = 0.0
-        if mask_cls_B.sum() > 0:
-            lprobs_B = F.log_softmax(logits_B[mask_cls_B], dim=-1)
-            loss_semi_B = label_smoothed_nll_loss(lprobs_B, celltype_B[mask_cls_B].to(self.device), label_smoothing)
+        z_labeled = z_combined[mask_cls_combined]  
+        output = self.CLS(z_labeled)  
+        target = celltype_combined[mask_cls_combined].to(self.device, non_blocking=True)
     
-        loss_semi = loss_semi_A + loss_semi_B
+        c = output.size()[-1] 
+        eps = label_smoothing 
+        
+        log_preds = F.log_softmax(output, dim=-1)
+        
+        if reduction == 'sum':
+            loss_smooth = - log_preds.sum()  # sum模式：所有元素求和
+        else: 
+            loss_smooth = - log_preds.sum(dim=-1)  # 先按类别维度sum
+            loss_smooth = loss_smooth.mean()       # 再按样本维度mean
+        
+        loss_hard = F.nll_loss(log_preds, target, reduction=reduction, weight=weight)
+        loss_semi = loss_smooth * eps / c + (1 - eps) * loss_hard
+        
         return loss_semi
     
 
@@ -405,6 +454,11 @@ class IntegrationModel:
                          + list(self.G_A.parameters()) 
                          + list(self.G_B.parameters())
                          )
+        
+        if self.celltype_col is not None:
+            self.CLS = Classifier(self.n_latent, self.unique_celltypes.shape[0])
+            self.CLS = self.CLS.to(self.device)
+            self.params_G += list(self.CLS.parameters()) 
         
         self.optimizer_G = optim.AdamW(self.params_G, lr=1e-3, weight_decay=1e-3)
 
@@ -495,45 +549,13 @@ class IntegrationModel:
         self.latent = np.concatenate([mu_A.cpu().numpy(), mu_B.cpu().numpy()], axis=0)
 
         end_time = time.time()
-        print(f"Completed at: {time.asctime(time.localtime(end_time))}")
         print(f"Total time: {end_time - begin_time:.2f}s")
         print(f"Latent shape: {self.latent.shape}")
-
-
-    def update_shared_mask(
-        self,
-        resolution=1.0,
-        min_shared_frac=0.05,
-        min_similarity=0.9,
-    ):
-        print("Updating shared mask...")
-
-        self._set_eval_mode()
-
-        x_A = torch.stack([self.dataset_A[i]["input"] for i in range(len(self.dataset_A))]).float().to(self.device)
-        x_B = torch.stack([self.dataset_B[i]["input"] for i in range(len(self.dataset_B))]).float().to(self.device)
-
-        with torch.no_grad():
-            _, mu_A, _ = self.E_A_fast(x_A)
-            _, mu_B, _ = self.E_B_fast(x_B)
-
-        self.is_shared_A, self.is_shared_B = leiden_shared_mask(
-            z_A=mu_A.cpu().numpy(),
-            z_B=mu_B.cpu().numpy(),
-            resolution=resolution,
-            min_shared_frac=min_shared_frac,
-            min_similarity=min_similarity,
-            device=self.device,
-        )
-
-        print(f"Shared cells: A={self.is_shared_A.sum().item()} "f"B={self.is_shared_B.sum().item()}")
 
 
     def get_imputation(self):
         self._set_eval_mode()
         begin_time = time.time()
-
-        print(f"Imputation started at: {time.asctime()}")
 
         x_A = torch.stack([self.dataset_A[i]["input"] for i in range(len(self.dataset_A))]).float().to(self.device)
         x_B = torch.stack([self.dataset_B[i]["input"] for i in range(len(self.dataset_B))]).float().to(self.device)
@@ -548,7 +570,32 @@ class IntegrationModel:
         self.imputed_BtoA = x_BtoA.cpu().numpy()
 
         end_time = time.time()
-        print(f"Completed at: {time.asctime()}")
+        print(f"Total time: {end_time - begin_time:.2f}s")
+
+
+    def predict_celltype(self):
+        self._set_eval_mode()
+        begin_time = time.time()
+
+        x_A = torch.stack([self.dataset_A[i]["input"] for i in range(len(self.dataset_A))]).float().to(self.device)
+        x_B = torch.stack([self.dataset_B[i]["input"] for i in range(len(self.dataset_B))]).float().to(self.device)
+
+        with torch.no_grad():  
+            _, mu_A, _ = self.E_A_fast(x_A)
+            _, mu_B, _ = self.E_B_fast(x_B)
+            pred_A_score = self.CLS(mu_A) 
+            pred_B_score = self.CLS(mu_B)  
+
+        self.pred_A_score = pred_A_score.cpu().numpy()
+        self.pred_B_score = pred_B_score.cpu().numpy()
+
+        pred_A_idx = torch.argmax(pred_A_score, dim=1).cpu().numpy()
+        pred_B_idx = torch.argmax(pred_B_score, dim=1).cpu().numpy()
+
+        self.pred_A_label = self.unique_celltypes[pred_A_idx]
+        self.pred_B_label = self.unique_celltypes[pred_B_idx]
+
+        end_time = time.time()
         print(f"Total time: {end_time - begin_time:.2f}s")
 
 
@@ -564,3 +611,82 @@ class IntegrationModel:
 
         torch.save(state, os.path.join(model_path, "ckpt.pth"))
         print(f"Model saved to {model_path}/ckpt.pth")
+
+
+    def update_shared_mask(
+            self,
+            resolution=1.0,
+            min_shared_frac=0.05,
+            min_similarity=0.9,
+        ):
+            print("Updating shared mask...")
+
+            self._set_eval_mode()
+
+            x_A = torch.stack([self.dataset_A[i]["input"] for i in range(len(self.dataset_A))]).float().to(self.device)
+            x_B = torch.stack([self.dataset_B[i]["input"] for i in range(len(self.dataset_B))]).float().to(self.device)
+
+            with torch.no_grad():
+                _, mu_A, _ = self.E_A_fast(x_A)
+                _, mu_B, _ = self.E_B_fast(x_B)
+
+            self.is_shared_A, self.is_shared_B = leiden_shared_mask(
+                z_A=mu_A.cpu().numpy(),
+                z_B=mu_B.cpu().numpy(),
+                resolution=resolution,
+                min_shared_frac=min_shared_frac,
+                min_similarity=min_similarity,
+                device=self.device,
+            )
+
+            num_shared_A = self.is_shared_A.sum().item()
+            num_shared_B = self.is_shared_B.sum().item()
+
+            total_A = mu_A.shape[0]
+            total_B = mu_B.shape[0]
+
+            print(f"Shared cells: "
+                f"A={num_shared_A}/{total_A} ({num_shared_A/total_A*100:.2f}%) | "
+                f"B={num_shared_B}/{total_B} ({num_shared_B/total_B*100:.2f}%)")
+
+
+
+    def update_pseudo_label(
+            self,
+            threshold=0.9,
+            normalize=True
+        ):
+            print("Updating pseudo labels...")
+
+            self._set_eval_mode()
+
+            x_A = torch.stack([self.dataset_A[i]["input"] for i in range(len(self.dataset_A))]).float().to(self.device)
+            x_B = torch.stack([self.dataset_B[i]["input"] for i in range(len(self.dataset_B))]).float().to(self.device)
+
+            with torch.no_grad():
+                _, mu_A, _ = self.E_A_fast(x_A)
+                _, mu_B, _ = self.E_B_fast(x_B)
+
+            build_proto_and_update_dataset(
+                z_A=mu_A,
+                z_B=mu_B,
+                dataset_A=self.dataset_A,
+                dataset_B=self.dataset_B,
+                num_classes=len(self.unique_celltypes),
+                threshold=threshold,
+                normalize=normalize,
+                device=self.device)
+            
+            mask_A = self.dataset_A.pseudo_labels != -1
+            mask_B = self.dataset_B.pseudo_labels != -1
+
+            num_classes = len(self.unique_celltypes)
+
+            self.weight2 = compute_celltype_weights(
+                celltype_series_A=self.dataset_A.pseudo_labels[mask_A],
+                celltype_series_B=self.dataset_B.pseudo_labels[mask_B],
+                unique_labels=np.arange(num_classes),
+                weight_foo=np.sqrt,
+                n_add=0,
+                device=self.device
+            )
