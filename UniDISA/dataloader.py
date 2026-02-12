@@ -166,25 +166,6 @@ def load_data(
     return dataloader
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 class InfiniteRandomSampler(Sampler):
     """Sampler that yields infinite random batches."""
     def __init__(self, data_source: Dataset, batch_size: int) -> None:
