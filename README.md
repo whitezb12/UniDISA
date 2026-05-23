@@ -53,7 +53,7 @@ pip install .
 
 ## Tutorials
 
-Three step-by-step tutorials are included in the `Tutorial` folder.
+Two step-by-step tutorials are included in the `Tutorial` folder.
 Datasets are available on https://drive.google.com/drive/folders/1pVxUQ5uwa-txwE4LvjaPzKrVirYA5LbQ?usp=drive_link.
 
 - [Tutorial 1: RNA + ATAC Integration (Muto-2021)](./Tutorial/RNA+ATAC_Muto-2021.ipynb)
