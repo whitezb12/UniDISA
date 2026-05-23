@@ -18,7 +18,6 @@ class IntegrationModel:
         input_key: List[str] = ["X_pca", "X_lsi"],
         batch_size: int = 500,
         n_latent: int = 10,
-        celltype_col: Optional[str] = None,
         source_col: Optional[str] = None,
         device: Optional[torch.device] = None,
         seed: int = 1234,
@@ -34,47 +33,21 @@ class IntegrationModel:
 
         self.batch_size = batch_size
         self.n_latent = n_latent
-        self.celltype_col = celltype_col
         self.source_col = source_col
-        
-        if self.celltype_col is not None:
-            celltypes_A = np.unique(adata_A.obs[self.celltype_col].dropna()) if self.celltype_col in adata_A.obs else np.array([])
-            celltypes_B = np.unique(adata_B.obs[self.celltype_col].dropna()) if self.celltype_col in adata_B.obs else np.array([])
-            self.unique_celltypes = np.union1d(celltypes_A, celltypes_B)
-            self.weight1 = compute_celltype_weights(
-                celltype_series_A=adata_A.obs[self.celltype_col].dropna(),  
-                celltype_series_B=adata_B.obs[self.celltype_col].dropna(),  
-                unique_labels=self.unique_celltypes,         
-                weight_foo=np.sqrt,
-                n_add=0,
-                device=self.device
-            )  #True label weight
-            self.weight2 = self.weight1 #Pseudo label weight
-        else:
-            self.unique_celltypes = None
-            self.weight = None
 
         self.dataset_A = AnnDataDataset(
             adata_A,
             input_key=input_key[0],
-            output_layer=None,
-            celltype_key=self.celltype_col,
-            source_key=self.source_col,
-            mode="integration",
-            unique_labels=self.unique_celltypes
+            source_key=self.source_col
         )
         self.dataset_B = AnnDataDataset(
             adata_B,
             input_key=input_key[1],
-            output_layer=None,
-            celltype_key=self.celltype_col,
-            source_key=self.source_col,
-            mode="integration",
-            unique_labels=self.unique_celltypes
+            source_key=self.source_col
         )
 
-        self.dataloader_A = load_data(self.dataset_A, batch_size=self.batch_size, mode="integration")
-        self.dataloader_B = load_data(self.dataset_B, batch_size=self.batch_size, mode="integration")
+        self.dataloader_A = load_data(self.dataset_A, batch_size=self.batch_size)
+        self.dataloader_B = load_data(self.dataset_B, batch_size=self.batch_size)
 
         self.is_shared_A = torch.ones(adata_A.shape[0], dtype=torch.bool, device=self.device)
         self.is_shared_B = torch.ones(adata_B.shape[0], dtype=torch.bool, device=self.device)
@@ -84,9 +57,8 @@ class IntegrationModel:
         self,
         training_steps: int = 2000,
         lambdaRecon: float = 10.0,
-        lambdaLA: float = 10.0,
+        lambdaLA: float = 1.0,
         lambdaDA: float = 1.0,
-        lambdasemi: float = 1.0
     ):
 
         self._init_models_and_optimizers()
@@ -136,18 +108,10 @@ class IntegrationModel:
             z_dist = pairwise_euclidean_distance(mu_A, mu_B) + pairwise_euclidean_distance(sigma_A, sigma_B)
             loss_DA = torch.sum(P * z_dist) / torch.sum(P)
 
-            # semi loss
-            if self.celltype_col is not None:
-                loss_semi = self._compute_semi_loss(z_A, z_B, batch_A['celltype'], batch_B['celltype'], weight=self.weight1) 
-                loss_semi += self._compute_semi_loss(z_A, z_B, batch_A['pseudo_label'], batch_B['pseudo_label'], weight=self.weight2) 
-            else:
-                loss_semi = torch.tensor(0.0, device=self.device)
-
             total_loss = (
                 lambdaRecon * loss_AE
                 + lambdaLA * loss_LA
                 + lambdaDA * loss_DA
-                + lambdasemi * loss_semi
             )
 
             self.optimizer_G.zero_grad()
@@ -160,8 +124,7 @@ class IntegrationModel:
                     f"[Stage1 {step}] "
                     f"AE: {loss_AE.item():.4f} | "
                     f"LA: {loss_LA.item():.4f} | "
-                    f"DA: {loss_DA.item():.4f} | "
-                    f"Semi: {loss_semi.item():.4f}"
+                    f"DA: {loss_DA.item():.4f}"
                 )
 
         self.update_slow_encoder()
@@ -171,11 +134,10 @@ class IntegrationModel:
         self,
         training_steps: int = 3000,
         lambdaRecon: float = 10.0,
-        lambdaLA: float = 10.0,
+        lambdaLA: float = 1.0,
         lambdaDA: float = 1.0,
-        lambdasemi: float = 1.0,
         n_iters: int = 1,
-        use_shared_mask: bool = True,
+        use_shared_mask: bool = False,
     ):
 
         self._init_models_and_optimizers()
@@ -233,18 +195,10 @@ class IntegrationModel:
                 z_dist = pairwise_euclidean_distance(mu_A[mask_A], mu_B[mask_B]) + pairwise_euclidean_distance(sigma_A[mask_A], sigma_B[mask_B])
                 loss_DA = torch.sum(P * z_dist) / torch.sum(P)
 
-                # semi loss
-                if self.celltype_col is not None:
-                    loss_semi = self._compute_semi_loss(z_A, z_B, batch_A['celltype'], batch_B['celltype'], weight=self.weight1) 
-                    loss_semi += self._compute_semi_loss(z_A, z_B, batch_A['pseudo_label'], batch_B['pseudo_label'], weight=self.weight2) 
-                else:
-                    loss_semi = torch.tensor(0.0, device=self.device)
-
                 total_loss = (
                     lambdaRecon * loss_AE
                     + lambdaLA * loss_LA
                     + lambdaDA * loss_DA
-                    + lambdasemi * loss_semi
                 )
 
                 self.optimizer_G.zero_grad()
@@ -257,8 +211,7 @@ class IntegrationModel:
                         f"[Stage2 {step}] "
                         f"AE: {loss_AE.item():.4f} | "
                         f"LA: {loss_LA.item():.4f} | "
-                        f"DA: {loss_DA.item():.4f} | "
-                        f"Semi: {loss_semi.item():.4f}"
+                        f"DA: {loss_DA.item():.4f}"
                     )
             if use_shared_mask:
                 self.update_shared_mask()
@@ -270,11 +223,10 @@ class IntegrationModel:
         self,
         training_steps: int = 10000,
         lambdaRecon: float = 10.0,
-        lambdaLA: float = 10.0,
+        lambdaLA: float = 1.0,
         lambdaDA: float = 1.0,
         lambdamGAN: float = 1.0,
         lambdabGAN: float = 0.5,
-        lambdasemi: float = 1.0,
         use_mGAN: bool = True
     ):
 
@@ -358,20 +310,12 @@ class IntegrationModel:
             else:
                 loss_bGAN = torch.tensor(0.0, device=self.device)                
 
-            # semi loss
-            if self.celltype_col is not None:
-                loss_semi = self._compute_semi_loss(z_A, z_B, batch_A['celltype'], batch_B['celltype'], weight=self.weight1) 
-                loss_semi += self._compute_semi_loss(z_A, z_B, batch_A['pseudo_label'], batch_B['pseudo_label'], weight=self.weight2) 
-            else:
-                loss_semi = torch.tensor(0.0, device=self.device)
-            
             total_loss = (
                 lambdaRecon * loss_AE
                 + lambdaLA * loss_LA
                 + lambdaDA * loss_DA
                 + lambdamGAN * loss_mGAN
                 + lambdabGAN * loss_bGAN
-                + lambdasemi * loss_semi
             )
 
             self.optimizer_G.zero_grad()
@@ -386,8 +330,7 @@ class IntegrationModel:
                     f"LA: {loss_LA:.4f} | "
                     f"DA: {loss_DA:.4f} | "
                     f"mGAN: {loss_mGAN:.4f} | "
-                    f"bGAN: {loss_bGAN:.4f} | "
-                    f"Semi: {loss_semi:.4f}"
+                    f"bGAN: {loss_bGAN:.4f}"
                 )
 
 
@@ -402,46 +345,6 @@ class IntegrationModel:
         return sum(losses)
     
 
-    def _compute_semi_loss(
-        self, 
-        z_A: torch.Tensor, 
-        z_B: torch.Tensor, 
-        celltype_A: torch.Tensor, 
-        celltype_B: torch.Tensor, 
-        label_smoothing: float = 0.1,
-        reduction: str = 'mean',
-        weight: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-
-        z_combined = torch.cat([z_A, z_B], dim=0)  
-        celltype_combined = torch.cat([celltype_A, celltype_B], dim=0)  
-        mask_cls_combined = (celltype_combined != -1) 
-        n_labeled = mask_cls_combined.sum().item()   
-        
-        if n_labeled == 0:
-            return torch.tensor(0.0, device=self.device, dtype=z_A.dtype)  
-        
-        z_labeled = z_combined[mask_cls_combined]  
-        output = self.CLS(z_labeled)  
-        target = celltype_combined[mask_cls_combined].to(self.device, non_blocking=True)
-    
-        c = output.size()[-1] 
-        eps = label_smoothing 
-        
-        log_preds = F.log_softmax(output, dim=-1)
-        
-        if reduction == 'sum':
-            loss_smooth = - log_preds.sum()  # sum模式：所有元素求和
-        else: 
-            loss_smooth = - log_preds.sum(dim=-1)  # 先按类别维度sum
-            loss_smooth = loss_smooth.mean()       # 再按样本维度mean
-        
-        loss_hard = F.nll_loss(log_preds, target, reduction=reduction, weight=weight)
-        loss_semi = loss_smooth * eps / c + (1 - eps) * loss_hard
-        
-        return loss_semi
-    
-
     def _init_models_and_optimizers(self):
         self.E_A_fast = VAEEncoder(self.dataset_A.feature_shapes["input"], self.n_latent).to(self.device)
         self.E_B_fast = VAEEncoder(self.dataset_B.feature_shapes["input"], self.n_latent).to(self.device)
@@ -454,11 +357,6 @@ class IntegrationModel:
                          + list(self.G_A.parameters()) 
                          + list(self.G_B.parameters())
                          )
-        
-        if self.celltype_col is not None:
-            self.CLS = LinearClassifier(self.n_latent, self.unique_celltypes.shape[0])
-            self.CLS = self.CLS.to(self.device)
-            self.params_G += list(self.CLS.parameters()) 
         
         self.optimizer_G = optim.AdamW(self.params_G, lr=1e-3, weight_decay=1e-3)
 
@@ -573,32 +471,6 @@ class IntegrationModel:
         print(f"Total time: {end_time - begin_time:.2f}s")
 
 
-    def predict_celltype(self):
-        self._set_eval_mode()
-        begin_time = time.time()
-
-        x_A = torch.stack([self.dataset_A[i]["input"] for i in range(len(self.dataset_A))]).float().to(self.device)
-        x_B = torch.stack([self.dataset_B[i]["input"] for i in range(len(self.dataset_B))]).float().to(self.device)
-
-        with torch.no_grad():  
-            _, mu_A, _ = self.E_A_fast(x_A)
-            _, mu_B, _ = self.E_B_fast(x_B)
-            pred_A_score = self.CLS(mu_A) 
-            pred_B_score = self.CLS(mu_B)  
-
-        self.pred_A_score = pred_A_score.cpu().numpy()
-        self.pred_B_score = pred_B_score.cpu().numpy()
-
-        pred_A_idx = torch.argmax(pred_A_score, dim=1).cpu().numpy()
-        pred_B_idx = torch.argmax(pred_B_score, dim=1).cpu().numpy()
-
-        self.pred_A_label = self.unique_celltypes[pred_A_idx]
-        self.pred_B_label = self.unique_celltypes[pred_B_idx]
-
-        end_time = time.time()
-        print(f"Total time: {end_time - begin_time:.2f}s")
-
-
     def save_model(self, model_path):
         os.makedirs(model_path, exist_ok=True)
 
@@ -617,7 +489,7 @@ class IntegrationModel:
             self,
             resolution=1.0,
             min_shared_frac=0.05,
-            min_similarity=0.9,
+            min_similarity=0.8,
         ):
             print("Updating shared mask...")
 
@@ -648,46 +520,3 @@ class IntegrationModel:
             print(f"Shared cells: "
                 f"A={num_shared_A}/{total_A} ({num_shared_A/total_A*100:.2f}%) | "
                 f"B={num_shared_B}/{total_B} ({num_shared_B/total_B*100:.2f}%)")
-
-
-
-    def update_pseudo_label(
-            self,
-            threshold=0.9,
-            normalize=True
-        ):
-            print("Updating pseudo labels...")
-
-            self._set_eval_mode()
-
-            x_A = torch.stack([self.dataset_A[i]["input"] for i in range(len(self.dataset_A))]).float().to(self.device)
-            x_B = torch.stack([self.dataset_B[i]["input"] for i in range(len(self.dataset_B))]).float().to(self.device)
-
-            with torch.no_grad():
-                _, mu_A, _ = self.E_A_fast(x_A)
-                _, mu_B, _ = self.E_B_fast(x_B)
-
-            build_proto_and_update_dataset(
-                z_A=mu_A,
-                z_B=mu_B,
-                dataset_A=self.dataset_A,
-                dataset_B=self.dataset_B,
-                num_classes=len(self.unique_celltypes),
-                threshold=threshold,
-                normalize=normalize,
-                device=self.device)
-            
-            mask_A = self.dataset_A.pseudo_labels != -1
-            mask_B = self.dataset_B.pseudo_labels != -1
-
-            num_classes = len(self.unique_celltypes)
-
-            self.weight2 = compute_celltype_weights(
-                celltype_series_A=self.dataset_A.pseudo_labels[mask_A],
-                celltype_series_B=self.dataset_B.pseudo_labels[mask_B],
-                unique_labels=np.arange(num_classes),
-                weight_foo=np.sqrt,
-                n_add=0,
-                device=self.device
-            )
-
