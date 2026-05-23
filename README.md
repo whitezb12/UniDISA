@@ -44,8 +44,8 @@ pip install .
 Three step-by-step tutorials are included in the `Tutorial` folder.
 Datasets are available on https://drive.google.com/drive/folders/1pVxUQ5uwa-txwE4LvjaPzKrVirYA5LbQ?usp=drive_link.
 
-- [Tutorial 1: Integrating RNA and ATAC modality: Muto-2021 (multi-batch)](./Tutorials/RNA+ATAC_Muto-2021.ipynb)
-- [Tutorial 2: Integrating RNA and ADT modality: TEA-seq (PBMC)](./Tutorials/RNA+ADT_TEA-seq_PBMC.ipynb)
+- [Tutorial 1: RNA + ATAC Integration (Muto-2021)](./Tutorial/RNA+ATAC_Muto-2021.ipynb)
+- [Tutorial 2: RNA + ADT Integration (TEA-seq)](./Tutorial/RNA+ADT_TEA-seq_PBMC.ipynb)
 
 
 ## Support
