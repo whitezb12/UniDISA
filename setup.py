@@ -16,6 +16,7 @@ setup(
     install_requires=[
         "torch>=2.0.0,<3.0",
         "scanpy>=1.9.0,<2.0",
+        "scib",
         "numpy",
         "pandas",
         "anndata",
