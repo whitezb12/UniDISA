@@ -20,6 +20,7 @@ setup(
         "numpy",
         "pandas",
         "anndata",
+        "scib_metrics",
     ],
     classifiers=[
         "Programming Language :: Python :: 3",
