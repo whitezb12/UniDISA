@@ -33,8 +33,20 @@ conda create -n UniDISA python=3.10
 
 #activate your environment
 conda activate UniDISA
+```
 
-#install UniDISA
+We also recommend installing PyTorch first:
+
+```
+# For GPU support
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126  
+# For CPU only
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+```
+
+Then install UniDISA:
+
+```
 pip install .
 ```
 
