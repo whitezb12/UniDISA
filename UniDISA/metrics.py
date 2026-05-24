@@ -2,7 +2,6 @@ import numpy as np
 from sklearn.neighbors import KNeighborsClassifier, NearestNeighbors
 from sklearn.metrics import accuracy_score, f1_score
 
-
 def label_transfer(ref, query, embed="X_emb", label_key="celltype", k=15, metric="cosine"):
     X_train = np.asarray(ref.obsm[embed]) if embed in ref.obsm else np.asarray(ref.X)
     X_test = np.asarray(query.obsm[embed]) if embed in query.obsm else np.asarray(query.X)
@@ -65,60 +64,4 @@ def mean_average_precision(adata, embed="X_emb", label_key="celltype", neighbor_
     return float(map_score)
 
 
-def run_metrics(
-    adata,
-    batch_key,
-    label_key,
-    embed="X_emb",
-    cluster_key="cluster",
-    nmi_method="arithmetic",
-    nmi_dir=None,
-    si_metric="euclidean",
-    subsample=0.5,
-    n_cores=1,
-    type_=None,
-    verbose=False,
-):
-    map_score = mean_average_precision(adata, embed=embed, label_key=label_key)
-    asw_label = scib.metrics.silhouette(adata, label_key=label_key, embed=embed, metric=si_metric)
-    _, _, _ = scib.metrics.cluster_optimal_resolution(
-        adata, label_key=label_key, cluster_key=cluster_key, use_rep=embed, force=True,
-        verbose=verbose, return_all=True
-    )
-    nmi_score = scib.metrics.nmi(
-        adata, cluster_key=cluster_key, label_key=label_key,
-        implementation=nmi_method, nmi_dir=nmi_dir
-    )
-    ari_score = float(scib.metrics.ari(adata, cluster_key=cluster_key, label_key=label_key))
-    clisi = scib.metrics.clisi_graph(
-        adata, batch_key=batch_key, label_key=label_key, type_=type_,
-        subsample=subsample * 100, scale=True, n_cores=n_cores, verbose=verbose
-    )
-    asw_batch = scib.metrics.silhouette_batch(
-        adata, batch_key=batch_key, label_key=label_key, embed=embed, metric=si_metric
-    )
-    graph_conn = scib.metrics.graph_connectivity(adata, label_key=label_key)
-    kbet = scib.metrics.kBET(
-        adata, batch_key=batch_key, label_key=label_key, type_=type_,
-        embed=embed, scaled=True, verbose=verbose
-    )
-    ilisi = scib.metrics.ilisi_graph(
-        adata, batch_key=batch_key, type_=type_,
-        subsample=subsample * 100, scale=True, n_cores=n_cores, verbose=verbose
-    )
 
-    transfer_acc, transfer_f1 = calculate_shared_type_transfer_metrics(adata, batch_key, label_key, embed="X_emb")
-
-    return {
-        "Mean_average_precision": map_score,
-        "ASW_label": asw_label,
-        "NMI_cluster/label": nmi_score,
-        "ARI_cluster/label": ari_score,
-        "cLISI": clisi,
-        "ASW_batch": asw_batch,
-        "Graph_connectivity": graph_conn,
-        "iLISI": ilisi,
-        "KBET": kbet,
-        "transfer_accuracy": transfer_acc,
-        "transfer_f1": transfer_f1,
-    }
